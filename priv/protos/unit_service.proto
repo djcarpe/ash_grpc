@@ -1,0 +1,121 @@
+// Proto schema for the AshGrpc demo — used by grpcurl for local testing.
+// Field numbers and types must match the Elixir proto stubs in demo_server.exs.
+//
+// Run with docker compose:
+//   docker compose up --build
+//
+// Example grpcurl (plaintext, no TLS):
+//   grpcurl -plaintext -proto priv/protos/unit_service.proto \
+//     -d '{"name":"Widget A","sku":"WGT-001","quantity":10}' \
+//     localhost:50051 demo.inventory.UnitService/CreateUnit
+
+syntax = "proto3";
+
+package demo.inventory;
+
+service UnitService {
+  rpc CreateUnit (CreateUnitRequest)            returns (CreateUnitResponse);
+  rpc GetUnit    (GetUnitRequest)               returns (GetUnitResponse);
+  rpc ListUnits  (ListUnitsRequest)             returns (stream ListUnitsResponse);
+  rpc UpdateUnit (UpdateUnitRequest)            returns (UpdateUnitResponse);
+  rpc DeleteUnit (DeleteUnitRequest)            returns (DeleteUnitResponse);
+  rpc BulkIngest (stream BulkIngestRequest)     returns (BulkIngestResponse);
+}
+
+// ── Requests ─────────────────────────────────────────────────────────────────
+
+message CreateUnitRequest {
+  string name     = 1;
+  string sku      = 2;
+  int64  quantity = 3;
+  bool   active   = 4;
+}
+
+message GetUnitRequest {
+  string id = 1;
+}
+
+message ListUnitsRequest {}
+
+message UpdateUnitRequest {
+  string id       = 1;
+  string name     = 2;
+  int64  quantity = 3;
+  bool   active   = 4;
+}
+
+message DeleteUnitRequest {
+  string id = 1;
+}
+
+message BulkIngestRequest {
+  string name     = 1;
+  string sku      = 2;
+  int64  quantity = 3;
+  bool   active   = 4;
+}
+
+// ── Responses ────────────────────────────────────────────────────────────────
+// Note: create/update/delete return a `records` wrapper because AshGrpc.Proto.Generator
+// treats all non-get, non-streaming methods as potential list responses.
+// GetUnit and ListUnits return flat structs because they use get?: true / server_stream: true.
+
+message CreateUnitResponse {
+  message Record {
+    string id       = 1;
+    string name     = 2;
+    string sku      = 3;
+    int64  quantity = 4;
+    bool   active   = 5;
+  }
+  repeated Record records = 1;
+}
+
+message GetUnitResponse {
+  string id       = 1;
+  string name     = 2;
+  string sku      = 3;
+  int64  quantity = 4;
+  bool   active   = 5;
+}
+
+message ListUnitsResponse {
+  string id       = 1;
+  string name     = 2;
+  string sku      = 3;
+  int64  quantity = 4;
+  bool   active   = 5;
+}
+
+message UpdateUnitResponse {
+  message Record {
+    string id       = 1;
+    string name     = 2;
+    string sku      = 3;
+    int64  quantity = 4;
+    bool   active   = 5;
+  }
+  repeated Record records = 1;
+}
+
+message DeleteUnitResponse {
+  message Record {
+    string id       = 1;
+    string name     = 2;
+    string sku      = 3;
+    int64  quantity = 4;
+    bool   active   = 5;
+  }
+  repeated Record records = 1;
+}
+
+message BulkIngestResponse {
+  message Record {
+    string id       = 1;
+    string name     = 2;
+    string sku      = 3;
+    int64  quantity = 4;
+    bool   active   = 5;
+  }
+  repeated Record records = 1;
+}

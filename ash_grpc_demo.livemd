@@ -1,0 +1,476 @@
+# AshGrpc: gRPC Extension for Ash Resources
+
+```elixir
+Application.put_env(:ash, :validate_domain_resource_inclusion?, false)
+Application.put_env(:ash, :validate_domain_config_inclusion?, false)
+
+Mix.install(
+  [
+    {:ash_grpc, path: "/data/"},
+    {:ash, "~> 3.0"},
+    {:grpc, "~> 0.9"},
+    {:protobuf, "~> 0.13"},
+    {:jason, "~> 1.4"}
+  ],
+  consolidate_protocols: false
+)
+```
+
+## What Is AshGrpc?
+
+`AshGrpc` maps Ash actions to [gRPC](https://grpc.io/) methods. Add the extension to a resource, declare which actions to expose, and you get:
+
+1. **A generated `.proto` file** — the canonical contract for your service, derived entirely from the resource and its actions. No hand-authoring proto files.
+2. **A `GRPC.Server` implementation** — one callback per method, wired to `AshGrpc.Server.Dispatcher`.
+3. **Full introspection** — the method configuration is queryable at compile time.
+
+AshGrpc handles unary, server-streaming (a stream of records), and client-streaming (a batch of inputs) patterns. It also ships interceptors for authentication, trace propagation, and telemetry.
+
+## The Domain: Inventory Units
+
+We'll model a simple inventory service. A Unit has a name, SKU, and quantity. We want unary create / get-by-id / update / delete methods, a server-streaming list for live feeds, and a client-streaming bulk-ingest endpoint.
+
+```elixir
+defmodule Demo.Inventory.Unit do
+  use Ash.Resource,
+    domain: Demo.Inventory,
+    data_layer: Ash.DataLayer.Ets,
+    extensions: [AshGrpc.Resource]
+
+  grpc do
+    # Fully-qualified proto service name.
+    # The proto package is derived from everything before the last segment.
+    service_name "demo.inventory.UnitService"
+
+    # method <dsl_name>, action: <ash_action_name>, [options]
+    method :create_unit,  action: :create
+    method :get_unit,     action: :read,    get?: true          # returns a single record
+    method :list_units,   action: :read,    server_stream: true # streams one record per message
+    method :update_unit,  action: :update
+    method :delete_unit,  action: :destroy
+    method :bulk_ingest,  action: :create,  client_stream: true # receives a stream of inputs
+  end
+
+  attributes do
+    uuid_primary_key :id
+
+    attribute :name,     :string,  allow_nil?: false, public?: true
+    attribute :sku,      :string,  allow_nil?: false, public?: true
+    attribute :quantity, :integer, default: 0,        public?: true
+    attribute :active,   :boolean, default: true,     public?: true
+
+    create_timestamp :inserted_at
+    update_timestamp :updated_at
+  end
+
+  actions do
+    defaults [:read, :destroy]
+
+    create :create do
+      accept [:name, :sku, :quantity, :active]
+    end
+
+    update :update do
+      accept [:name, :quantity, :active]
+    end
+  end
+end
+
+defmodule Demo.Inventory do
+  use Ash.Domain, validate_config_inclusion?: false
+
+  resources do
+    resource Demo.Inventory.Unit
+  end
+end
+```
+
+## Introspection
+
+`AshGrpc.Resource.Info` exposes the full gRPC configuration at compile time — no server or proto files needed.
+
+```elixir
+# All declared methods
+AshGrpc.Resource.Info.methods(Demo.Inventory.Unit)
+```
+
+```elixir
+# Look up by DSL name
+AshGrpc.Resource.Info.method(Demo.Inventory.Unit, :create_unit)
+```
+
+```elixir
+# Look up by wire RPC name (PascalCase of the method name)
+AshGrpc.Resource.Info.method_by_rpc(Demo.Inventory.Unit, "GetUnit")
+```
+
+```elixir
+# Resolved service name
+AshGrpc.Resource.Info.service_name!(Demo.Inventory.Unit)
+```
+
+```elixir
+# Proto package — derived from service_name if not set explicitly
+AshGrpc.Resource.Info.package!(Demo.Inventory.Unit)
+```
+
+## Proto Generation
+
+This runs entirely in the notebook — no NATS server, no protoc, no S3. `AshGrpc.Proto.Generator.generate/1` inspects the resource and emits a complete proto3 definition.
+
+```elixir
+proto = AshGrpc.Proto.Generator.generate(Demo.Inventory.Unit)
+IO.puts(proto)
+```
+
+### What the generator derives
+
+| Element            | Source                                                                    |
+| ------------------ | ------------------------------------------------------------------------- |
+| `package`          | `service_name` minus the last segment                                     |
+| `rpc` names        | `rpc_name` (default: PascalCase of the DSL method name)                   |
+| Request fields     | Accepted attributes for the action + PK fields for get/update/destroy     |
+| Response fields    | Public resource attributes (optionally restricted by `fields:`)           |
+| List response      | Wraps the record message in `repeated … records = 1;`                   |
+| `stream` keyword   | Added when `server_stream: true` or `client_stream: true`                 |
+| Well-known imports | `google/protobuf/timestamp.proto` added automatically for datetime fields |
+
+### A resource with custom rpc_name, datetime, and doc comments
+
+```elixir
+defmodule Demo.Telemetry.Reading do
+  use Ash.Resource,
+    domain: Demo.Telemetry,
+    data_layer: Ash.DataLayer.Ets,
+    extensions: [AshGrpc.Resource]
+
+  grpc do
+    service_name "demo.telemetry.ReadingService"
+
+    # Override the default wire name ("Ingest" instead of "Ingest").
+    method :ingest, action: :create,
+      rpc_name: "Ingest",
+      description: "Record a new sensor reading."
+
+    # Server-streaming: each matching record is sent as a separate message.
+    method :stream_readings, action: :read, server_stream: true,
+      description: "Stream all readings matching the filter."
+  end
+
+  attributes do
+    uuid_primary_key :id
+    attribute :sensor_id,   :string,            public?: true
+    attribute :value,       :float,             public?: true
+    attribute :recorded_at, :utc_datetime_usec, public?: true
+  end
+
+  actions do
+    defaults [:read]
+    create :create do
+      accept [:sensor_id, :value, :recorded_at]
+    end
+  end
+end
+
+defmodule Demo.Telemetry do
+  use Ash.Domain, validate_config_inclusion?: false
+  resources do
+    resource Demo.Telemetry.Reading
+  end
+end
+
+IO.puts(AshGrpc.Proto.Generator.generate(Demo.Telemetry.Reading))
+```
+
+Notice that `recorded_at` (`Ash.Type.UtcDatetimeUsec`) maps to `google.protobuf.Timestamp` and the import is added automatically.
+
+### Type mapping reference
+
+```elixir
+alias AshGrpc.Proto.TypeMapping
+
+# We simulate what the generator does for common Ash types.
+# proto_type/1 takes %{type: …, constraints: …} and returns {proto_type, repeated?}.
+ash_types = [
+  Ash.Type.String,
+  Ash.Type.CiString,
+  Ash.Type.Integer,
+  Ash.Type.Float,
+  Ash.Type.Boolean,
+  Ash.Type.UUID,
+  Ash.Type.Decimal,
+  Ash.Type.UtcDatetime,
+  Ash.Type.UtcDatetimeUsec,
+  Ash.Type.Date,
+  Ash.Type.Time,
+  Ash.Type.Map,
+  Ash.Type.Binary
+]
+
+for type <- ash_types do
+  {proto_type, repeated?} = TypeMapping.proto_type(%{type: type, constraints: []})
+  r = if repeated?, do: "repeated ", else: ""
+  "#{inspect(type)} → #{r}#{proto_type}"
+end
+```
+
+```elixir
+# Arrays map to repeated fields
+{proto_type, repeated?} =
+  TypeMapping.proto_type(%{type: {:array, Ash.Type.String}, constraints: [items: []]})
+
+"Array of strings → repeated? #{repeated?}, type: #{proto_type}"
+```
+
+## The Server Module
+
+After running `protoc` on the generated `.proto` file you get a `GRPC.Service` module (e.g. `Demo.Inventory.UnitService.Service`). Wire it to the Ash dispatcher with `AshGrpc.Server`:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defmodule Demo.Inventory.UnitServer do
+  use AshGrpc.Server,
+    resource: Demo.Inventory.Unit,
+    service:  Demo.Inventory.UnitService.Service
+end
+```
+
+`AshGrpc.Server` expands to one function per method. For unary methods:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+def create_unit(request, stream) do
+  case AshGrpc.Server.Dispatcher.dispatch(
+    Demo.Inventory.Unit, :create_unit, request, stream
+  ) do
+    {:ok, reply} -> reply
+    {:error, %GRPC.RPCError{} = err} -> raise err
+  end
+end
+```
+
+For server-streaming methods (`:list_units`, `:stream_readings`):
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+def list_units(request, stream) do
+  case AshGrpc.Server.Dispatcher.dispatch(
+    Demo.Inventory.Unit, :list_units, request, stream
+  ) do
+    {:ok, _stream} -> :ok      # replies were sent via GRPC.Server.send_reply/2
+    {:error, err}  -> raise err
+  end
+end
+```
+
+## The Dispatcher
+
+`AshGrpc.Server.Dispatcher` is the runtime engine. For each incoming RPC it:
+
+1. Looks up the method configuration from the resource
+2. **Decodes** the protobuf request struct into a plain Ash input map (`AshGrpc.Codec.decode_request/1`)
+3. Reads actor and tenant from `stream.local` (populated by the Context interceptor)
+4. Runs the Ash action
+5. **Encodes** the result back into the response message struct (`AshGrpc.Codec.encode_response/3`)
+
+### Codec walkthrough
+
+```elixir
+alias AshGrpc.Codec
+
+# decode_request strips struct metadata and normalises values.
+# Google.Protobuf.Timestamp → DateTime; repeated fields → lists.
+# Without a real proto module we'll simulate the input:
+simulated_request = %{name: "Widget A", sku: "WGT-001", quantity: 100, active: true}
+Codec.decode_request(simulated_request)
+```
+
+```elixir
+# encode_value converts Ash-native types to proto-friendly scalars:
+# DateTime → Google.Protobuf.Timestamp
+# Decimal  → string
+# atom     → string (non-boolean)
+# map      → JSON string
+
+examples = [
+  ~U[2026-06-16 12:00:00Z],
+  Decimal.new("19.99"),
+  :active,
+  %{"key" => "value"}
+]
+
+for v <- examples do
+  encoded = apply(Codec, :encode_value, [v])
+  "#{inspect(v)} → #{inspect(encoded)}"
+end
+```
+
+### Error mapping
+
+Ash error classes map to gRPC status codes:
+
+```elixir
+# Ash.Error.Invalid      → GRPC.Status.invalid_argument()  (3)
+# Ash.Error.Forbidden    → GRPC.Status.permission_denied()  (7)
+# Ash.Error.Query.NotFound → GRPC.Status.not_found()        (5)
+# anything else          → GRPC.Status.internal()           (13)
+
+# get? reads that return nil reply with NOT_FOUND:
+# {:error, %GRPC.RPCError{status: 5, message: "not found"}}
+:ok
+```
+
+## Streaming
+
+### Server-streaming
+
+For `server_stream: true` methods the dispatcher uses `Ash.stream!/2` (which paginates under the hood) and sends each record as a separate reply via `GRPC.Server.send_reply/2`:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# Each record in the result set arrives as a separate gRPC message.
+# The client iterates with Enum.to_list/1 or Stream.each/2.
+{:ok, stream} = Demo.Inventory.UnitService.Stub.list_units(channel, %{})
+Enum.each(stream, fn {:ok, unit} -> IO.inspect(unit) end)
+```
+
+### Client-streaming
+
+For `client_stream: true` methods (like `:bulk_ingest`) the dispatcher receives an enumerable of request messages. For create actions it delegates to `Ash.bulk_create/4`:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+inputs = Stream.map(csv_rows, &%Demo.Inventory.IngestRequest{name: &1.name, sku: &1.sku})
+{:ok, result} = Demo.Inventory.UnitService.Stub.bulk_ingest(channel, inputs)
+```
+
+## Interceptors
+
+### Server side
+
+**`AshGrpc.Interceptors.Context`** — resolves actor and tenant from request headers, stashes them in `stream.local`:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# In your GRPC.Server endpoint:
+intercept AshGrpc.Interceptors.Context,
+  actor:  {MyApp.Auth,    :actor_from_token},
+  tenant: {MyApp.Tenancy, :from_headers}
+# Each MFA receives the headers map and returns the value (or nil).
+```
+
+**`AshGrpc.Interceptors.Telemetry`** — wraps each RPC call with telemetry events:
+
+```elixir
+# Events emitted:
+events = [
+  {[:ash_grpc, :rpc, :start],     "system_time", "method + service name"},
+  {[:ash_grpc, :rpc, :stop],      "duration",    "method + service name"},
+  {[:ash_grpc, :rpc, :exception], "duration",    "method + service + kind + status"}
+]
+
+for {event, measurement, metadata} <- events do
+  "#{inspect(event)} — measurements: #{measurement}, metadata: #{metadata}"
+end
+```
+
+### Client side
+
+**`AshGrpc.Interceptors.Client.Auth`** — injects a bearer token into outbound headers:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# Per-connection:
+GRPC.Stub.connect("localhost:50051",
+  interceptors: [{AshGrpc.Interceptors.Client.Auth, token: my_jwt}])
+
+# Or per-process (useful in tests):
+Process.put(:ash_grpc_token, my_jwt)
+```
+
+**`AshGrpc.Interceptors.Client.Trace`** — W3C trace context propagation + round-trip telemetry:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# Requires opentelemetry_api (optional dep).
+# Injects traceparent / tracestate headers when the OTel propagator is loaded.
+# Emits [:ash_grpc, :client, :rpc] with duration and :ok / :error tag.
+GRPC.Stub.connect("localhost:50051",
+  interceptors: [AshGrpc.Interceptors.Client.Trace])
+```
+
+## Mix Task: gen_proto
+
+Generate proto files for an entire domain (or specific resources) and write them to disk:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# Scan a domain
+mix ash_grpc.gen_proto --domain Demo.Inventory --out priv/protos
+
+# Multiple domains
+mix ash_grpc.gen_proto \
+  --domain Demo.Inventory \
+  --domain Demo.Telemetry \
+  --out priv/protos
+
+# A single resource
+mix ash_grpc.gen_proto --resource Demo.Inventory.Unit --out priv/protos
+```
+
+After generating, compile with `protoc` to produce Elixir message and service modules:
+
+```bash
+protoc --elixir_out=plugins=grpc:./lib priv/protos/unit.proto
+```
+
+## Full Lifecycle
+
+```elixir
+# Let's review the complete generated proto for both resources one more time:
+IO.puts("=== Inventory ===")
+IO.puts(AshGrpc.Proto.Generator.generate(Demo.Inventory.Unit))
+
+IO.puts("=== Telemetry ===")
+IO.puts(AshGrpc.Proto.Generator.generate(Demo.Telemetry.Reading))
+```
+
+The workflow from zero to serving gRPC traffic:
+
+```
+1. Add extensions: [AshGrpc.Resource] to your resource
+2. Declare methods in a grpc do … end block
+3. mix ash_grpc.gen_proto --domain MyApp.Domain --out priv/protos
+4. protoc --elixir_out=plugins=grpc:./lib priv/protos/*.proto
+5. defmodule MyApp.UnitServer do
+     use AshGrpc.Server, resource: MyApp.Unit, service: MyApp.UnitService.Service
+   end
+6. {GRPC.Server.Supervisor,
+     endpoint: MyApp.GrpcEndpoint, port: 50051, start_server: true}
+```
+
+## Summary
+
+| Concept               | Where it lives                                                   |
+| --------------------- | ---------------------------------------------------------------- |
+| Method declarations   | `grpc do … end` on the resource                                |
+| Proto source of truth | `AshGrpc.Proto.Generator` + `mix ash_grpc.gen_proto`             |
+| Type mapping          | `AshGrpc.Proto.TypeMapping` (Ash types → proto scalars)        |
+| Runtime dispatch      | `AshGrpc.Server.Dispatcher`                                      |
+| Encode / decode       | `AshGrpc.Codec`                                                  |
+| Server wiring         | `use AshGrpc.Server, resource: …, service: …`                |
+| Auth                  | `AshGrpc.Interceptors.Context` (server) + `Client.Auth` (client) |
+| Tracing               | `AshGrpc.Interceptors.Client.Trace`                              |
+| Telemetry             | `AshGrpc.Interceptors.Telemetry`                                 |
+| Code generation       | `mix ash_grpc.gen_proto`                                         |
+
+The Ash resource is the single source of truth. Proto files are derived, not authored. Add the extension, run the generator, wire the server — gRPC comes for free.

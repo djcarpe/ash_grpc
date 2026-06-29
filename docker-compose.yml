@@ -1,0 +1,47 @@
+services:
+
+  # ── Livebook ──────────────────────────────────────────────────────────────
+  # Open http://localhost:8080 and use password: livebook123
+  # Navigate to the notebook via the "Open" button → /data/ash_grpc_demo.livemd
+  # The first cell runs Mix.install — allow 3-5 min on a cold cache.
+  livebook:
+    image: ghcr.io/livebook-dev/livebook:latest
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - .:/data
+      - livebook-home:/home/livebook
+    environment:
+      LIVEBOOK_HOME: /data
+      LIVEBOOK_SECRET_KEY_BASE: "ash_grpc_demo_secret_key_base_change_this_in_production_xxxxxxxxxx"
+      LIVEBOOK_PASSWORD: "livebook1234"
+
+  # ── gRPC demo server ──────────────────────────────────────────────────────
+  # Runs demo_server.exs which starts the UnitService on :50051.
+  # First run downloads + compiles deps (Mix.install); takes ~3 min.
+  # Subsequent runs use the cached volume and start in seconds.
+  grpc-demo:
+    image: elixir:latest
+    working_dir: /app
+    ports:
+      - "50051:50051"
+    volumes:
+      - .:/app
+      - mix-cache:/root/.mix
+      - build-cache:/app/_build
+    environment:
+      MIX_ENV: dev
+      GRPC_PORT: "50051"
+    # Install git (needed by some Mix deps), bootstrap hex/rebar, then run the script.
+    command: >
+      sh -c "apt-get update -q &&
+             apt-get install -y -q --no-install-recommends git ca-certificates &&
+             mix local.hex --force --quiet &&
+             mix local.rebar --force --quiet &&
+             elixir demo_server.exs"
+
+volumes:
+  livebook-home:
+  mix-cache:
+  build-cache:
